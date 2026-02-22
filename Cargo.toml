@@ -1,0 +1,23 @@
+[package]
+name = "semantic_skeletonizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+dashmap = "6.1.0"
+ignore = "0.4.25"
+notify = "8.2.0"
+serde = "1.0.228"
+serde_json = "1.0.149"
+swc = "55.0.0"
+swc_common = "18.0.1"
+swc_ecma_ast = { version = "20.0.1", features = ["serde", "serde-impl"] }
+swc_ecma_codegen = "23.0.0"
+swc_ecma_minifier = "45.0.0"
+swc_ecma_parser = "34.0.0"
+swc_ecma_visit = { version = "20.0.0", features = ["path"] }
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
