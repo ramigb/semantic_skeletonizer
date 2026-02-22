@@ -1,5 +1,9 @@
 # Semantic Skeletonizer (MCP Server)
 
+<p align="center">
+  <img src="assets/logo.png" alt="Semantic Skeletonizer Logo" width="300" />
+</p>
+
 Semantic Skeletonizer is a stateful, event-driven Model Context Protocol (MCP) server written in Rust. It generates and maintains an in-memory Topological Graph (Code Property Graph / Semantic Skeleton) of a TypeScript/React codebase.
 
 Instead of lossy text compression, this server grants LLMs native, bidirectional sensory access to a repository by stripping out internal functional logic while preserving structural topology (types, interfaces, class structures) using `swc`. As files change, the server dynamically recalculates the Abstract Syntax Tree (AST) via a background watcher (`notify`) and pushes delta updates to connected clients over `stdio`.
@@ -10,6 +14,7 @@ Instead of lossy text compression, this server grants LLMs native, bidirectional
 - [Architecture Overview](#architecture-overview)
 - [Setup & Installation](#setup--installation)
 - [How to Use (Capabilities & Protocol)](#how-to-use-capabilities--protocol)
+- [Example Prompts](#example-prompts)
 
 ---
 
@@ -43,7 +48,7 @@ Instead of lossy text compression, this server grants LLMs native, bidirectional
 
 ---
 
-## 🚀 Setup & Installation
+## Setup & Installation
 
 ### Prerequisites
 - [Rust & Cargo](https://rustup.rs/) (edition 2024 or higher recommended)
@@ -77,7 +82,7 @@ For **Claude Desktop**, edit your `claude_desktop_config.json` (usually found in
 
 ---
 
-## 🛠️ How to Use (Capabilities & Protocol)
+## How to Use (Capabilities & Protocol)
 
 Once connected, the LLM client interacts with the server over `stdio` via standard MCP JSON-RPC messages.
 
@@ -108,7 +113,7 @@ If the LLM needs to dive deeper into a specific piece of logic, it can invoke th
 
 ---
 
-## 💡 Example Prompts
+## Example Prompts
 
 Here are a few ways to interact with the Semantic Skeletonizer using an LLM (like Claude):
 
