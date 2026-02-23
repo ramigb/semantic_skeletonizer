@@ -10,11 +10,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use swc_common::{sync::Lrc, SourceMap, DUMMY_SP, SyntaxContext};
-use swc_ecma_ast::*;
-use swc_ecma_codegen::{text_writer::JsWriter, Config, Emitter, Node};
-use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
-use swc_ecma_visit::{VisitMut, VisitMutWith};
+use oxc_allocator::Allocator;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
+use oxc_codegen::{Codegen, Gen};
+use oxc_ast_visit::VisitMut;
+use oxc_ast::ast::*;
+use oxc_syntax::scope::ScopeFlags;
 
 // --- MCP PROTOCOL STRUCTURES ---
 
@@ -57,43 +59,37 @@ struct FileSkeleton {
 
 // --- SKELETONIZER ---
 
-pub struct Skeletonizer;
+pub struct Skeletonizer<'a> {
+    pub allocator: &'a Allocator,
+}
 
-impl VisitMut for Skeletonizer {
-    fn visit_mut_function(&mut self, n: &mut Function) {
-        n.visit_mut_children_with(self);
-        if let Some(body) = &mut n.body {
-            body.stmts.clear();
+impl<'a> VisitMut<'a> for Skeletonizer<'a> {
+    fn visit_function(&mut self, func: &mut Function<'a>, flags: ScopeFlags) {
+        if let Some(body) = &mut func.body {
+            body.statements.clear();
         }
+        oxc_ast_visit::walk_mut::walk_function(self, func, flags);
     }
 
-    fn visit_mut_arrow_expr(&mut self, n: &mut ArrowExpr) {
-        n.visit_mut_children_with(self);
-        n.body = Box::new(BlockStmtOrExpr::BlockStmt(BlockStmt {
-            span: DUMMY_SP,
-            ctxt: SyntaxContext::empty(),
-            stmts: vec![],
-        }));
+    fn visit_arrow_function_expression(&mut self, expr: &mut ArrowFunctionExpression<'a>) {
+        expr.body.statements.clear();
+        oxc_ast_visit::walk_mut::walk_arrow_function_expression(self, expr);
     }
 
-    fn visit_mut_class_method(&mut self, n: &mut ClassMethod) {
-        n.visit_mut_children_with(self);
-        if let Some(body) = &mut n.function.body {
-            body.stmts.clear();
-        }
-    }
-
-    fn visit_mut_module_items(&mut self, items: &mut Vec<ModuleItem>) {
-        items.retain(|item| {
-            if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
-                let src = format!("{:?}", import.src.value);
+    fn visit_program(&mut self, program: &mut Program<'a>) {
+        program.body.retain(|stmt| {
+            if let Statement::ImportDeclaration(import) = stmt {
+                let src = import.source.value.as_str();
                 if src.contains(".css") || src.contains(".scss") || src.contains(".svg") {
                     return false;
                 }
             }
             true
         });
-        items.visit_mut_children_with(self);
+        
+        for stmt in program.body.iter_mut() {
+            self.visit_statement(stmt);
+        }
     }
 }
 
@@ -113,85 +109,58 @@ impl AppState {
 
 // --- CORE UTILS ---
 
-fn parse_file(path: &Path) -> Result<(Lrc<SourceMap>, Module)> {
-    let cm: Lrc<SourceMap> = Default::default();
+fn parse_file<'a>(allocator: &'a Allocator, source_text: &'a str, path: &Path) -> Result<Program<'a>> {
+    let source_type = SourceType::from_path(path).unwrap_or_default();
+    let ret = Parser::new(allocator, source_text, source_type).parse();
 
-    let fm = cm.load_file(path).context("failed to load file")?;
-
-    let lexer = Lexer::new(
-        Syntax::Typescript(TsSyntax {
-            tsx: path.extension().map_or(false, |ext| ext == "tsx"),
-            decorators: true,
-            ..Default::default()
-        }),
-        Default::default(),
-        StringInput::from(&*fm),
-        None,
-    );
-
-    let mut parser = Parser::new_from(lexer);
-
-    let module = parser
-        .parse_typescript_module()
-        .map_err(|e| anyhow::anyhow!("failed to parse module: {:?}", e.into_kind()))?;
-
-    Ok((cm, module))
-}
-
-fn stringify_item<N: Node>(node: &N, cm: Lrc<SourceMap>) -> String {
-    let mut buf = vec![];
-    {
-        let mut emitter = Emitter {
-            cfg: Default::default(),
-            cm: cm.clone(),
-            comments: None,
-            wr: JsWriter::new(cm.clone(), "\n", &mut buf, None),
-        };
-        node.emit_with(&mut emitter).unwrap();
+    if ret.errors.is_empty() {
+        Ok(ret.program)
+    } else {
+        Err(anyhow::anyhow!("failed to parse module: {:?}", ret.errors))
     }
-    String::from_utf8(buf).unwrap_or_default()
 }
 
-fn extract_ir(module: &Module, cm: Lrc<SourceMap>) -> FileSkeleton {
+fn stringify_item<'a, T: Gen>(item: &T) -> String {
+    let mut codegen = Codegen::new();
+    item.r#gen(&mut codegen, oxc_codegen::Context::default());
+    codegen.into_source_text()
+}
+
+fn extract_ir(program: &Program<'_>) -> FileSkeleton {
     let mut ir = FileSkeleton::default();
-    for item in &module.body {
-        match item {
-            ModuleItem::ModuleDecl(decl) => match decl {
-                ModuleDecl::Import(n) => ir.imports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::ExportDecl(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::ExportNamed(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::ExportDefaultDecl(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::ExportDefaultExpr(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::ExportAll(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::TsImportEquals(n) => ir.imports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::TsExportAssignment(n) => ir.exports.push(stringify_item(n, cm.clone())),
-                ModuleDecl::TsNamespaceExport(n) => ir.exports.push(stringify_item(n, cm.clone())),
-            },
-            ModuleItem::Stmt(stmt) => match stmt {
-                Stmt::Decl(decl) => match decl {
-                    Decl::Class(n) => ir.classes.push(stringify_item(n, cm.clone())),
-                    Decl::Fn(n) => ir.functions.push(stringify_item(n, cm.clone())),
-                    Decl::Var(n) => ir.variables.push(stringify_item(n, cm.clone())),
-                    Decl::TsInterface(n) => ir.interfaces.push(stringify_item(n, cm.clone())),
-                    Decl::TsTypeAlias(n) => ir.interfaces.push(stringify_item(n, cm.clone())),
-                    Decl::TsEnum(n) => ir.interfaces.push(stringify_item(n, cm.clone())),
-                    Decl::TsModule(n) => ir.interfaces.push(stringify_item(n, cm.clone())),
-                    Decl::Using(_) => {}
-                },
-                _ => {}
-            },
+    for stmt in &program.body {
+        match stmt {
+            Statement::ImportDeclaration(decl) => ir.imports.push(stringify_item(&**decl)),
+            Statement::ExportNamedDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::ExportDefaultDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::ExportAllDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::TSImportEqualsDeclaration(decl) => ir.imports.push(stringify_item(&**decl)),
+            Statement::TSExportAssignment(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::TSNamespaceExportDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            
+            Statement::ClassDeclaration(decl) => ir.classes.push(stringify_item(&**decl)),
+            Statement::FunctionDeclaration(decl) => ir.functions.push(stringify_item(&**decl)),
+            Statement::VariableDeclaration(decl) => ir.variables.push(stringify_item(&**decl)),
+            Statement::TSInterfaceDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
+            Statement::TSTypeAliasDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
+            Statement::TSEnumDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
+            Statement::TSModuleDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
+            
+            _ => {}
         }
     }
     ir
 }
 
 fn skeletonize_file(path: &Path) -> Result<FileSkeleton> {
-    let (cm, mut module) = parse_file(path)?;
+    let allocator = Allocator::default();
+    let source_text = std::fs::read_to_string(path).context("failed to load file")?;
+    let mut program = parse_file(&allocator, &source_text, path)?;
 
-    let mut skeletonizer = Skeletonizer;
-    module.visit_mut_with(&mut skeletonizer);
+    let mut skeletonizer = Skeletonizer { allocator: &allocator };
+    skeletonizer.visit_program(&mut program);
 
-    Ok(extract_ir(&module, cm))
+    Ok(extract_ir(&program))
 }
 
 fn perform_initial_sweep(state: &Arc<AppState>) {
@@ -254,10 +223,11 @@ async fn watch_filesystem(state: Arc<AppState>, tx: mpsc::Sender<()>) -> Result<
 }
 
 fn get_implementation(path: &str, _target_node: &str) -> Result<Value> {
-    // Return full AST node as string maybe?
+    let allocator = Allocator::default();
     let path_buf = PathBuf::from(path);
-    let (_cm, module) = parse_file(&path_buf)?;
-    Ok(serde_json::to_value(&module)?)
+    let source_text = std::fs::read_to_string(&path_buf)?;
+    let program = parse_file(&allocator, &source_text, &path_buf)?;
+    Ok(json!(format!("{:#?}", program)))
 }
 
 // --- MAIN LOOP ---
