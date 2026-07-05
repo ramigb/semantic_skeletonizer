@@ -168,14 +168,36 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                         }
                     },
                     {
-                        "name": "list_functions",
-                        "description": "Lists all functions in a specific file.",
+                        "name": "list_symbols",
+                        "description": "Lists every top-level symbol in a file as {name, kind, exported, signature}. Kinds: function, arrow_function, class, method, interface, type, enum, variable, component.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "file_path": { "type": "string" }
                             },
                             "required": ["file_path"]
+                        }
+                    },
+                    {
+                        "name": "list_functions",
+                        "description": "Lists callable symbols (functions, arrow functions, methods, components) in a specific file. Alias of list_symbols filtered to callable kinds.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": { "type": "string" }
+                            },
+                            "required": ["file_path"]
+                        }
+                    },
+                    {
+                        "name": "search_symbols",
+                        "description": "Case-insensitive substring search for symbol names across the whole graph. Returns [{file, name, kind}].",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            },
+                            "required": ["query"]
                         }
                     }
                 ]
@@ -228,23 +250,61 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                             }
                         }
                     }
-                    "list_functions" => {
+                    "list_symbols" | "list_functions" => {
                         if let Some(args) = args {
                             let p = args.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
                             let key = state.key_for(p).unwrap_or_else(|| p.to_string());
                             if let Some(file_skeleton) = state.skeleton_graph.get(&key) {
+                                let symbols: Vec<_> = file_skeleton
+                                    .symbols
+                                    .iter()
+                                    .filter(|s| {
+                                        name != "list_functions"
+                                            || skeleton::CALLABLE_KINDS.contains(&s.kind.as_str())
+                                    })
+                                    .collect();
                                 response_value = Some(json!({
                                     "content": [{
                                         "type": "text",
-                                        "text": file_skeleton.functions.join("\n")
+                                        "text": serde_json::to_string(&symbols).unwrap_or_default()
                                     }]
                                 }));
                             } else {
-                                error_value = Some(json!({
-                                    "code": -32602,
-                                    "message": "File not found in graph."
+                                response_value = Some(json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("File not found in graph: {}", p)
+                                    }],
+                                    "isError": true
                                 }));
                             }
+                        }
+                    }
+                    "search_symbols" => {
+                        if let Some(args) = args {
+                            let query = args
+                                .get("query")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            let mut hits = Vec::new();
+                            for entry in state.skeleton_graph.iter() {
+                                for sym in &entry.value().symbols {
+                                    if sym.name.to_lowercase().contains(&query) {
+                                        hits.push(json!({
+                                            "file": entry.key(),
+                                            "name": sym.name,
+                                            "kind": sym.kind
+                                        }));
+                                    }
+                                }
+                            }
+                            response_value = Some(json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string(&hits).unwrap_or_default()
+                                }]
+                            }));
                         }
                     }
                     _ => {

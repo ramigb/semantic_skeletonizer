@@ -20,7 +20,20 @@ pub struct FileSkeleton {
     pub interfaces: Vec<String>,
     pub classes: Vec<String>,
     pub variables: Vec<String>,
+    pub symbols: Vec<SymbolInfo>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SymbolInfo {
+    pub name: String,
+    /// function | arrow_function | class | method | interface | type | enum |
+    /// variable | component
+    pub kind: String,
+    pub exported: bool,
+    pub signature: String,
+}
+
+pub const CALLABLE_KINDS: &[&str] = &["function", "arrow_function", "method", "component"];
 
 // --- SKELETONIZER ---
 
@@ -79,7 +92,183 @@ pub fn stringify_item<T: Gen>(item: &T) -> String {
     codegen.into_source_text()
 }
 
-fn extract_ir(program: &Program<'_>) -> FileSkeleton {
+/// Collapse a skeletonized node into a single-line signature.
+fn one_line(s: &str) -> String {
+    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.len() > 200 {
+        let mut cut = 200;
+        while !joined.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &joined[..cut])
+    } else {
+        joined
+    }
+}
+
+fn is_pascal_case(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// True when a binding's type annotation references `React.FC` / `FC`.
+fn annotation_is_fc(decl: &VariableDeclarator<'_>, source_text: &str) -> bool {
+    decl.type_annotation.as_ref().is_some_and(|ann| {
+        let span = ann.span();
+        let text = &source_text[span.start as usize..span.end as usize];
+        text.contains("React.FC")
+            || text.contains("FC<")
+            || text.trim_start_matches(':').trim() == "FC"
+    })
+}
+
+struct SymbolContext<'s> {
+    source_text: &'s str,
+    is_tsx: bool,
+}
+
+fn component_or(ctx: &SymbolContext, name: &str, fallback: &str) -> String {
+    if ctx.is_tsx && is_pascal_case(name) {
+        "component".to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn collect_decl_symbols(
+    decl: &Declaration<'_>,
+    exported: bool,
+    ctx: &SymbolContext,
+    out: &mut Vec<SymbolInfo>,
+) {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                out.push(SymbolInfo {
+                    name: id.name.to_string(),
+                    kind: component_or(ctx, &id.name, "function"),
+                    exported,
+                    signature: one_line(&stringify_item(&**f)),
+                });
+            }
+        }
+        Declaration::ClassDeclaration(c) => {
+            if let Some(name) = c.id.as_ref().map(|id| id.name.to_string()) {
+                out.push(SymbolInfo {
+                    name: name.clone(),
+                    kind: "class".to_string(),
+                    exported,
+                    signature: one_line(&stringify_item(&**c)),
+                });
+                for el in &c.body.body {
+                    if let ClassElement::MethodDefinition(m) = el {
+                        if let Some(mn) = m.key.static_name() {
+                            out.push(SymbolInfo {
+                                name: format!("{}.{}", name, mn),
+                                kind: "method".to_string(),
+                                exported,
+                                signature: one_line(&stringify_item(&**m)),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                let Some(name) = d.id.get_identifier_name() else {
+                    continue;
+                };
+                let is_component = ctx.is_tsx
+                    && (is_pascal_case(&name) || annotation_is_fc(d, ctx.source_text));
+                let kind = match &d.init {
+                    Some(Expression::ArrowFunctionExpression(_)) if is_component => "component",
+                    Some(Expression::FunctionExpression(_)) if is_component => "component",
+                    Some(Expression::ArrowFunctionExpression(_)) => "arrow_function",
+                    Some(Expression::FunctionExpression(_)) => "function",
+                    _ => "variable",
+                };
+                out.push(SymbolInfo {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    exported,
+                    signature: one_line(&format!("{} {}", v.kind.as_str(), stringify_item(d))),
+                });
+            }
+        }
+        Declaration::TSInterfaceDeclaration(i) => out.push(SymbolInfo {
+            name: i.id.name.to_string(),
+            kind: "interface".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**i)),
+        }),
+        Declaration::TSTypeAliasDeclaration(t) => out.push(SymbolInfo {
+            name: t.id.name.to_string(),
+            kind: "type".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**t)),
+        }),
+        Declaration::TSEnumDeclaration(e) => out.push(SymbolInfo {
+            name: e.id.name.to_string(),
+            kind: "enum".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**e)),
+        }),
+        _ => {}
+    }
+}
+
+fn collect_symbols(program: &Program<'_>, ctx: &SymbolContext) -> Vec<SymbolInfo> {
+    let mut out = Vec::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(d) = &e.declaration {
+                    collect_decl_symbols(d, true, ctx, &mut out);
+                }
+            }
+            Statement::ExportDefaultDeclaration(e) => {
+                let (name, kind, sig) = match &e.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        let name = f
+                            .id
+                            .as_ref()
+                            .map(|id| id.name.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        let kind = component_or(ctx, &name, "function");
+                        (name, kind, one_line(&stringify_item(&**f)))
+                    }
+                    ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                        let name = c
+                            .id
+                            .as_ref()
+                            .map(|id| id.name.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        (name, "class".to_string(), one_line(&stringify_item(&**c)))
+                    }
+                    _ => (
+                        "default".to_string(),
+                        "variable".to_string(),
+                        one_line(&stringify_item(&**e)),
+                    ),
+                };
+                out.push(SymbolInfo {
+                    name,
+                    kind,
+                    exported: true,
+                    signature: sig,
+                });
+            }
+            _ => {
+                if let Some(d) = stmt.as_declaration() {
+                    collect_decl_symbols(d, false, ctx, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
     let mut ir = FileSkeleton::default();
     for stmt in &program.body {
         match stmt {
@@ -104,6 +293,7 @@ fn extract_ir(program: &Program<'_>) -> FileSkeleton {
             _ => {}
         }
     }
+    ir.symbols = collect_symbols(program, ctx);
     ir
 }
 
@@ -114,7 +304,11 @@ pub fn skeletonize_source(source_text: &str, path: &Path) -> Result<FileSkeleton
     let mut skeletonizer = Skeletonizer;
     skeletonizer.visit_program(&mut program);
 
-    Ok(extract_ir(&program))
+    let ctx = SymbolContext {
+        source_text,
+        is_tsx: path.extension().and_then(|e| e.to_str()) == Some("tsx"),
+    };
+    Ok(extract_ir(&program, &ctx))
 }
 
 pub fn skeletonize_file(path: &Path) -> Result<FileSkeleton> {
