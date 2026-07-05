@@ -1,0 +1,763 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+use oxc_allocator::Allocator;
+use oxc_ast::ast::*;
+use oxc_ast_visit::VisitMut;
+use oxc_codegen::{Codegen, Gen};
+use oxc_parser::Parser;
+use oxc_span::{GetSpan, SourceType, Span};
+use oxc_syntax::scope::ScopeFlags;
+
+// --- IR STRUCTURES ---
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FileSkeleton {
+    pub imports: Vec<String>,
+    pub exports: Vec<String>,
+    pub functions: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub classes: Vec<String>,
+    pub variables: Vec<String>,
+    pub symbols: Vec<SymbolInfo>,
+    /// Structured import records (source specifier as written).
+    pub import_records: Vec<ImportRecord>,
+    /// Resolved graph keys this file imports (filled in by the graph layer).
+    pub dependencies: Vec<String>,
+    /// Bare (package) specifiers this file imports.
+    pub external_deps: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportRecord {
+    pub source: String,
+    pub names: Vec<String>,
+    pub type_only: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SymbolInfo {
+    pub name: String,
+    /// function | arrow_function | class | method | interface | type | enum |
+    /// variable | component
+    pub kind: String,
+    pub exported: bool,
+    pub signature: String,
+}
+
+pub const CALLABLE_KINDS: &[&str] = &["function", "arrow_function", "method", "component"];
+
+// --- SKELETONIZER ---
+
+pub struct Skeletonizer;
+
+impl<'a> VisitMut<'a> for Skeletonizer {
+    fn visit_function(&mut self, func: &mut Function<'a>, flags: ScopeFlags) {
+        if let Some(body) = &mut func.body {
+            body.statements.clear();
+        }
+        oxc_ast_visit::walk_mut::walk_function(self, func, flags);
+    }
+
+    fn visit_arrow_function_expression(&mut self, expr: &mut ArrowFunctionExpression<'a>) {
+        expr.body.statements.clear();
+        // An expression-bodied arrow (`() => x`) with its body cleared must
+        // become a block arrow, or codegen emits the invalid `() =>`.
+        expr.expression = false;
+        oxc_ast_visit::walk_mut::walk_arrow_function_expression(self, expr);
+    }
+
+    fn visit_property_definition(&mut self, prop: &mut PropertyDefinition<'a>) {
+        // Clear only function-valued initializers; type annotations and plain
+        // value initializers stay.
+        if matches!(
+            prop.value,
+            Some(Expression::ArrowFunctionExpression(_)) | Some(Expression::FunctionExpression(_))
+        ) {
+            prop.value = None;
+        }
+        oxc_ast_visit::walk_mut::walk_property_definition(self, prop);
+    }
+
+    fn visit_program(&mut self, program: &mut Program<'a>) {
+        program.body.retain(|stmt| {
+            if let Statement::ImportDeclaration(import) = stmt {
+                let src = import.source.value.as_str();
+                if src.contains(".css") || src.contains(".scss") || src.contains(".svg") {
+                    return false;
+                }
+            }
+            true
+        });
+
+        for stmt in program.body.iter_mut() {
+            self.visit_statement(stmt);
+        }
+    }
+}
+
+// --- CORE ---
+
+pub fn parse_source<'a>(
+    allocator: &'a Allocator,
+    source_text: &'a str,
+    path: &Path,
+) -> Result<Program<'a>> {
+    let source_type = SourceType::from_path(path).unwrap_or_default();
+    let ret = Parser::new(allocator, source_text, source_type).parse();
+
+    if ret.errors.is_empty() {
+        Ok(ret.program)
+    } else {
+        Err(anyhow::anyhow!("failed to parse module: {:?}", ret.errors))
+    }
+}
+
+pub fn stringify_item<T: Gen>(item: &T) -> String {
+    let mut codegen = Codegen::new();
+    item.r#gen(&mut codegen, oxc_codegen::Context::default());
+    codegen.into_source_text()
+}
+
+/// Collapse a skeletonized node into a single-line signature.
+fn one_line(s: &str) -> String {
+    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.len() > 200 {
+        let mut cut = 200;
+        while !joined.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &joined[..cut])
+    } else {
+        joined
+    }
+}
+
+fn is_pascal_case(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// True when a binding's type annotation references `React.FC` / `FC`.
+fn annotation_is_fc(decl: &VariableDeclarator<'_>, source_text: &str) -> bool {
+    decl.type_annotation.as_ref().is_some_and(|ann| {
+        let span = ann.span();
+        let text = &source_text[span.start as usize..span.end as usize];
+        text.contains("React.FC")
+            || text.contains("FC<")
+            || text.trim_start_matches(':').trim() == "FC"
+    })
+}
+
+struct SymbolContext<'s> {
+    source_text: &'s str,
+    is_tsx: bool,
+}
+
+fn component_or(ctx: &SymbolContext, name: &str, fallback: &str) -> String {
+    if ctx.is_tsx && is_pascal_case(name) {
+        "component".to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn collect_decl_symbols(
+    decl: &Declaration<'_>,
+    exported: bool,
+    ctx: &SymbolContext,
+    out: &mut Vec<SymbolInfo>,
+) {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                out.push(SymbolInfo {
+                    name: id.name.to_string(),
+                    kind: component_or(ctx, &id.name, "function"),
+                    exported,
+                    signature: one_line(&stringify_item(&**f)),
+                });
+            }
+        }
+        Declaration::ClassDeclaration(c) => {
+            if let Some(name) = c.id.as_ref().map(|id| id.name.to_string()) {
+                out.push(SymbolInfo {
+                    name: name.clone(),
+                    kind: "class".to_string(),
+                    exported,
+                    signature: one_line(&stringify_item(&**c)),
+                });
+                for el in &c.body.body {
+                    if let ClassElement::MethodDefinition(m) = el {
+                        if let Some(mn) = m.key.static_name() {
+                            out.push(SymbolInfo {
+                                name: format!("{}.{}", name, mn),
+                                kind: "method".to_string(),
+                                exported,
+                                signature: one_line(&stringify_item(&**m)),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                let Some(name) = d.id.get_identifier_name() else {
+                    continue;
+                };
+                let is_component = ctx.is_tsx
+                    && (is_pascal_case(&name) || annotation_is_fc(d, ctx.source_text));
+                let kind = match &d.init {
+                    Some(Expression::ArrowFunctionExpression(_)) if is_component => "component",
+                    Some(Expression::FunctionExpression(_)) if is_component => "component",
+                    Some(Expression::ArrowFunctionExpression(_)) => "arrow_function",
+                    Some(Expression::FunctionExpression(_)) => "function",
+                    _ => "variable",
+                };
+                let decl_text = if elidable_init_size(d).is_some() {
+                    declarator_text(d, ctx)
+                } else {
+                    stringify_item(d)
+                };
+                out.push(SymbolInfo {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    exported,
+                    signature: one_line(&format!("{} {}", v.kind.as_str(), decl_text)),
+                });
+            }
+        }
+        Declaration::TSInterfaceDeclaration(i) => out.push(SymbolInfo {
+            name: i.id.name.to_string(),
+            kind: "interface".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**i)),
+        }),
+        Declaration::TSTypeAliasDeclaration(t) => out.push(SymbolInfo {
+            name: t.id.name.to_string(),
+            kind: "type".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**t)),
+        }),
+        Declaration::TSEnumDeclaration(e) => out.push(SymbolInfo {
+            name: e.id.name.to_string(),
+            kind: "enum".to_string(),
+            exported,
+            signature: one_line(&stringify_item(&**e)),
+        }),
+        _ => {}
+    }
+}
+
+fn collect_symbols(program: &Program<'_>, ctx: &SymbolContext) -> Vec<SymbolInfo> {
+    let mut out = Vec::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(d) = &e.declaration {
+                    collect_decl_symbols(d, true, ctx, &mut out);
+                }
+            }
+            Statement::ExportDefaultDeclaration(e) => {
+                let (name, kind, sig) = match &e.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        let name = f
+                            .id
+                            .as_ref()
+                            .map(|id| id.name.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        let kind = component_or(ctx, &name, "function");
+                        (name, kind, one_line(&stringify_item(&**f)))
+                    }
+                    ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                        let name = c
+                            .id
+                            .as_ref()
+                            .map(|id| id.name.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        (name, "class".to_string(), one_line(&stringify_item(&**c)))
+                    }
+                    _ => (
+                        "default".to_string(),
+                        "variable".to_string(),
+                        one_line(&stringify_item(&**e)),
+                    ),
+                };
+                out.push(SymbolInfo {
+                    name,
+                    kind,
+                    exported: true,
+                    signature: sig,
+                });
+            }
+            _ => {
+                if let Some(d) = stmt.as_declaration() {
+                    collect_decl_symbols(d, false, ctx, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn import_record(decl: &ImportDeclaration<'_>) -> ImportRecord {
+    let names = decl
+        .specifiers
+        .as_ref()
+        .map(|specs| {
+            specs
+                .iter()
+                .map(|s| match s {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => s.local.name.to_string(),
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                        s.local.name.to_string()
+                    }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                        s.local.name.to_string()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ImportRecord {
+        source: decl.source.value.to_string(),
+        names,
+        type_only: decl.import_kind.is_type(),
+    }
+}
+
+/// Object/array literal initializers above this byte size are elided from the
+/// skeleton; smaller ones (regexes, constants, small configs) are signal.
+const ELIDE_THRESHOLD: usize = 200;
+
+fn elidable_init_size(d: &VariableDeclarator<'_>) -> Option<usize> {
+    let span = match &d.init {
+        Some(Expression::ObjectExpression(o)) => o.span,
+        Some(Expression::ArrayExpression(a)) => a.span,
+        _ => return None,
+    };
+    let size = (span.end - span.start) as usize;
+    (size > ELIDE_THRESHOLD).then_some(size)
+}
+
+/// Per-declarator skeleton text with oversized object/array literal
+/// initializers elided as `NAME: <annotation> = /* elided: N bytes */`.
+fn declarator_text(d: &VariableDeclarator<'_>, ctx: &SymbolContext) -> String {
+    let src = ctx.source_text;
+    let id_start = d.id.span().start as usize;
+    let id_end = d
+        .type_annotation
+        .as_ref()
+        .map(|a| a.span().end)
+        .unwrap_or(d.id.span().end) as usize;
+    let head = &src[id_start..id_end];
+    match (elidable_init_size(d), &d.init) {
+        (Some(n), _) => format!("{} = /* elided: {} bytes */", head, n),
+        (None, Some(init)) => {
+            let s = init.span();
+            format!("{} = {}", head, &src[s.start as usize..s.end as usize])
+        }
+        (None, None) => head.to_string(),
+    }
+}
+
+/// Skeleton text for a whole variable declaration.
+fn variable_decl_text(v: &VariableDeclaration<'_>, exported: bool, ctx: &SymbolContext) -> String {
+    let export_prefix = if exported { "export " } else { "" };
+    if !v.declarations.iter().any(|d| elidable_init_size(d).is_some()) {
+        return format!("{}{}", export_prefix, stringify_item(v));
+    }
+    let parts: Vec<String> = v
+        .declarations
+        .iter()
+        .map(|d| declarator_text(d, ctx))
+        .collect();
+    format!("{}{} {};", export_prefix, v.kind.as_str(), parts.join(", "))
+}
+
+/// Prepend the JSDoc block attached to the statement, if any, so `/** ... */`
+/// docs survive skeletonization.
+fn with_jsdoc(program: &Program<'_>, ctx: &SymbolContext, attach_point: u32, body: String) -> String {
+    for c in &program.comments {
+        if c.is_jsdoc() && c.attached_to == attach_point {
+            let doc = &ctx.source_text[c.span.start as usize..c.span.end as usize];
+            return format!("{}\n{}", doc, body);
+        }
+    }
+    body
+}
+
+fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
+    let mut ir = FileSkeleton::default();
+    for stmt in &program.body {
+        let start = stmt.span().start;
+        let doc = |body: String| with_jsdoc(program, ctx, start, body);
+        match stmt {
+            Statement::ImportDeclaration(decl) => {
+                ir.imports.push(stringify_item(&**decl));
+                ir.import_records.push(import_record(decl));
+            }
+            Statement::ExportNamedDeclaration(decl) => {
+                let text = match &decl.declaration {
+                    Some(Declaration::VariableDeclaration(v)) => variable_decl_text(v, true, ctx),
+                    _ => stringify_item(&**decl),
+                };
+                ir.exports.push(doc(text));
+                if let Some(src) = &decl.source {
+                    ir.import_records.push(ImportRecord {
+                        source: src.value.to_string(),
+                        names: decl
+                            .specifiers
+                            .iter()
+                            .map(|s| s.exported.name().to_string())
+                            .collect(),
+                        type_only: decl.export_kind.is_type(),
+                    });
+                }
+            }
+            Statement::ExportDefaultDeclaration(decl) => {
+                ir.exports.push(doc(stringify_item(&**decl)))
+            }
+            Statement::ExportAllDeclaration(decl) => {
+                ir.exports.push(stringify_item(&**decl));
+                ir.import_records.push(ImportRecord {
+                    source: decl.source.value.to_string(),
+                    names: vec!["*".to_string()],
+                    type_only: decl.export_kind.is_type(),
+                });
+            }
+            Statement::TSImportEqualsDeclaration(decl) => ir.imports.push(stringify_item(&**decl)),
+            Statement::TSExportAssignment(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::TSNamespaceExportDeclaration(decl) => {
+                ir.exports.push(stringify_item(&**decl))
+            }
+
+            Statement::ClassDeclaration(decl) => ir.classes.push(doc(stringify_item(&**decl))),
+            Statement::FunctionDeclaration(decl) => ir.functions.push(doc(stringify_item(&**decl))),
+            Statement::VariableDeclaration(decl) => {
+                ir.variables.push(doc(variable_decl_text(decl, false, ctx)))
+            }
+            Statement::TSInterfaceDeclaration(decl) => {
+                ir.interfaces.push(doc(stringify_item(&**decl)))
+            }
+            Statement::TSTypeAliasDeclaration(decl) => {
+                ir.interfaces.push(doc(stringify_item(&**decl)))
+            }
+            Statement::TSEnumDeclaration(decl) => ir.interfaces.push(doc(stringify_item(&**decl))),
+            Statement::TSModuleDeclaration(decl) => ir.interfaces.push(doc(stringify_item(&**decl))),
+
+            _ => {}
+        }
+    }
+    ir.symbols = collect_symbols(program, ctx);
+    ir
+}
+
+pub fn skeletonize_source(source_text: &str, path: &Path) -> Result<FileSkeleton> {
+    let allocator = Allocator::default();
+    let mut program = parse_source(&allocator, source_text, path)?;
+
+    let mut skeletonizer = Skeletonizer;
+    skeletonizer.visit_program(&mut program);
+
+    let ctx = SymbolContext {
+        source_text,
+        is_tsx: path.extension().and_then(|e| e.to_str()) == Some("tsx"),
+    };
+    Ok(extract_ir(&program, &ctx))
+}
+
+pub fn skeletonize_file(path: &Path) -> Result<FileSkeleton> {
+    let source_text = std::fs::read_to_string(path).context("failed to load file")?;
+    skeletonize_source(&source_text, path)
+}
+
+pub enum ImplLookup {
+    /// Original source text of the requested node, sliced by span.
+    Found(String),
+    /// Node not found; carries the available top-level symbol names.
+    NotFound(Vec<String>),
+}
+
+pub fn get_implementation(path: &Path, target_node: &str) -> Result<ImplLookup> {
+    let allocator = Allocator::default();
+    let source_text = std::fs::read_to_string(path).context("failed to load file")?;
+    let program = parse_source(&allocator, &source_text, path)?;
+
+    match find_target_span(&program, target_node) {
+        Some(span) => Ok(ImplLookup::Found(
+            source_text[span.start as usize..span.end as usize].to_string(),
+        )),
+        None => Ok(ImplLookup::NotFound(top_level_names(&program))),
+    }
+}
+
+fn class_name<'a>(class: &Class<'a>) -> Option<&'a str> {
+    class.id.as_ref().map(|id| id.name.as_str())
+}
+
+fn method_span(class: &Class<'_>, method: &str) -> Option<Span> {
+    class.body.body.iter().find_map(|el| match el {
+        ClassElement::MethodDefinition(m)
+            if m.key.static_name().is_some_and(|n| n == method) =>
+        {
+            Some(m.span)
+        }
+        _ => None,
+    })
+}
+
+/// Match `target` against a top-level declaration. `outer_span` is the span of
+/// the enclosing statement (so `export function foo` slices include `export`).
+fn match_declaration(decl: &Declaration<'_>, target: &str, outer_span: Span) -> Option<Span> {
+    let (class_part, method_part) = match target.split_once('.') {
+        Some((c, m)) => (Some(c), Some(m)),
+        None => (None, None),
+    };
+
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            (f.id.as_ref().is_some_and(|id| id.name == target)).then_some(outer_span)
+        }
+        Declaration::ClassDeclaration(c) => {
+            if class_name(c) == Some(target) {
+                return Some(outer_span);
+            }
+            if let (Some(cls), Some(m)) = (class_part, method_part) {
+                if class_name(c) == Some(cls) {
+                    return method_span(c, m);
+                }
+            }
+            None
+        }
+        Declaration::VariableDeclaration(v) => v.declarations.iter().find_map(|d| {
+            if d.id.get_identifier_name().is_some_and(|n| n == target) {
+                if v.declarations.len() == 1 {
+                    Some(outer_span)
+                } else {
+                    Some(d.span)
+                }
+            } else {
+                None
+            }
+        }),
+        Declaration::TSInterfaceDeclaration(i) => {
+            (i.id.name == target).then_some(outer_span)
+        }
+        Declaration::TSTypeAliasDeclaration(t) => (t.id.name == target).then_some(outer_span),
+        Declaration::TSEnumDeclaration(e) => (e.id.name == target).then_some(outer_span),
+        _ => None,
+    }
+}
+
+fn find_target_span(program: &Program<'_>, target: &str) -> Option<Span> {
+    for stmt in &program.body {
+        let outer_span = stmt.span();
+        let found = match stmt {
+            Statement::FunctionDeclaration(_)
+            | Statement::ClassDeclaration(_)
+            | Statement::VariableDeclaration(_)
+            | Statement::TSInterfaceDeclaration(_)
+            | Statement::TSTypeAliasDeclaration(_)
+            | Statement::TSEnumDeclaration(_) => stmt
+                .as_declaration()
+                .and_then(|d| match_declaration(d, target, outer_span)),
+            Statement::ExportNamedDeclaration(e) => e
+                .declaration
+                .as_ref()
+                .and_then(|d| match_declaration(d, target, outer_span)),
+            Statement::ExportDefaultDeclaration(e) => {
+                let named = match &e.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                        f.id.as_ref().is_some_and(|id| id.name == target)
+                    }
+                    ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                        class_name(c) == Some(target)
+                    }
+                    _ => false,
+                };
+                (target == "default" || named).then_some(outer_span)
+            }
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn declaration_names(decl: &Declaration<'_>, out: &mut Vec<String>) {
+    match decl {
+        Declaration::FunctionDeclaration(f) => {
+            if let Some(id) = &f.id {
+                out.push(id.name.to_string());
+            }
+        }
+        Declaration::ClassDeclaration(c) => {
+            if let Some(name) = class_name(c) {
+                out.push(name.to_string());
+                for el in &c.body.body {
+                    if let ClassElement::MethodDefinition(m) = el {
+                        if let Some(mn) = m.key.static_name() {
+                            out.push(format!("{}.{}", name, mn));
+                        }
+                    }
+                }
+            }
+        }
+        Declaration::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                if let Some(name) = d.id.get_identifier_name() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        Declaration::TSInterfaceDeclaration(i) => out.push(i.id.name.to_string()),
+        Declaration::TSTypeAliasDeclaration(t) => out.push(t.id.name.to_string()),
+        Declaration::TSEnumDeclaration(e) => out.push(e.id.name.to_string()),
+        _ => {}
+    }
+}
+
+/// All addressable top-level symbol names in a file (used for actionable
+/// "not found" errors).
+pub fn top_level_names(program: &Program<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(d) = &e.declaration {
+                    declaration_names(d, &mut names);
+                }
+            }
+            Statement::ExportDefaultDeclaration(_) => names.push("default".to_string()),
+            _ => {
+                if let Some(d) = stmt.as_declaration() {
+                    declaration_names(d, &mut names);
+                }
+            }
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skel(source: &str, name: &str) -> FileSkeleton {
+        skeletonize_source(source, Path::new(name)).unwrap()
+    }
+
+    #[test]
+    fn arrow_function_components_are_detected() {
+        let src = r#"
+import React from 'react';
+export interface FormProps { onSubmit: () => void; }
+export const Form = (props: FormProps) => {
+  return <div />;
+};
+const helper = () => 42;
+"#;
+        let ir = skel(src, "Form.tsx");
+        let form = ir.symbols.iter().find(|s| s.name == "Form").unwrap();
+        assert_eq!(form.kind, "component");
+        assert!(form.exported);
+        let helper = ir.symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert_eq!(helper.kind, "arrow_function");
+        assert!(!helper.exported);
+        assert!(ir.symbols.iter().any(|s| s.name == "FormProps" && s.kind == "interface"));
+    }
+
+    #[test]
+    fn fc_annotation_marks_component_even_without_pascal_case_body() {
+        let src = "import { FC } from 'react';\nexport const widget: FC<{}> = () => null;\n";
+        let ir = skel(src, "widget.tsx");
+        let w = ir.symbols.iter().find(|s| s.name == "widget").unwrap();
+        assert_eq!(w.kind, "component");
+    }
+
+    #[test]
+    fn function_bodies_are_stripped_but_signatures_survive() {
+        let src = "export function validate(u: string): boolean {\n  const x = u.trim();\n  return x.length > 0;\n}\n";
+        let ir = skel(src, "api.ts");
+        assert_eq!(ir.exports.len(), 1);
+        assert!(ir.exports[0].contains("validate(u: string): boolean"));
+        assert!(!ir.exports[0].contains("trim"));
+    }
+
+    #[test]
+    fn import_records_capture_names_and_type_only() {
+        let src = "import React from 'react';\nimport type { User } from './types';\nimport { a, b } from '../lib/util';\nimport './styles.css';\nexport * from './re';\n";
+        let ir = skel(src, "x.ts");
+        let sources: Vec<&str> = ir.import_records.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(sources, vec!["react", "./types", "../lib/util", "./re"]);
+        assert!(ir.import_records[1].type_only);
+        assert_eq!(ir.import_records[2].names, vec!["a", "b"]);
+        assert_eq!(ir.import_records[3].names, vec!["*"]);
+    }
+
+    #[test]
+    fn oversized_literals_are_elided_small_ones_kept() {
+        let big: String = (0..100)
+            .map(|i| format!("{{ id: {}, name: \"row-{}\" }}", i, i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!(
+            "export const TABLE: Row[] = [{}];\nexport const RE = /^[a-z]+$/;\n",
+            big
+        );
+        let ir = skel(&src, "data.ts");
+        let table = ir.exports.iter().find(|e| e.contains("TABLE")).unwrap();
+        assert!(table.contains("elided:"), "got: {}", table);
+        assert!(table.len() < 200);
+        assert!(table.contains("Row[]"));
+        let re = ir.exports.iter().find(|e| e.contains("RE")).unwrap();
+        assert!(re.contains("/^[a-z]+$/"));
+    }
+
+    #[test]
+    fn jsdoc_blocks_survive_skeletonization() {
+        let src = "/**\n * Frobnicates the widget.\n */\nexport function frob(): void {\n  console.log('x');\n}\n";
+        let ir = skel(src, "frob.ts");
+        assert!(ir.exports[0].starts_with("/**"));
+        assert!(ir.exports[0].contains("Frobnicates the widget."));
+        assert!(!ir.exports[0].contains("console.log"));
+    }
+
+    #[test]
+    fn class_property_function_initializers_cleared_values_kept() {
+        let src = "export class S {\n  name: string = 'svc';\n  fn = (x: number) => {\n    return x * 2;\n  };\n}\n";
+        let ir = skel(src, "s.ts");
+        let c = &ir.exports[0];
+        assert!(c.contains("name: string"));
+        assert!(c.contains("svc"));
+        assert!(!c.contains("x * 2"));
+    }
+
+    #[test]
+    fn get_implementation_slices_original_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("api.ts");
+        let func = "export function hi(): string {\n  // greet\n  return 'hi';\n}";
+        std::fs::write(&f, format!("const pad = 1;\n{}\nclass C {{ m() {{ return 2; }} }}\n", func)).unwrap();
+
+        match get_implementation(&f, "hi").unwrap() {
+            ImplLookup::Found(s) => assert_eq!(s, func),
+            _ => panic!("expected Found"),
+        }
+        match get_implementation(&f, "C.m").unwrap() {
+            ImplLookup::Found(s) => assert_eq!(s, "m() { return 2; }"),
+            _ => panic!("expected Found for C.m"),
+        }
+        match get_implementation(&f, "nope").unwrap() {
+            ImplLookup::NotFound(c) => {
+                assert!(c.contains(&"hi".to_string()));
+                assert!(c.contains(&"C.m".to_string()));
+            }
+            _ => panic!("expected NotFound"),
+        }
+    }
+}
