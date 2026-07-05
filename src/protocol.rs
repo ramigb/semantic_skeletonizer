@@ -157,7 +157,7 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                 "tools": [
                     {
                         "name": "get_implementation",
-                        "description": "Extracts complete inner logic of a node.",
+                        "description": "Returns the original source text of a single named node: a top-level function, class, class method (ClassName.methodName), arrow/function-expression binding, or the default export (target_node: \"default\").",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -198,18 +198,33 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                                 .key_for(p)
                                 .map(|k| state.abs_path(&k))
                                 .unwrap_or_else(|| std::path::PathBuf::from(p));
-                            if let Ok(ast) = skeleton::get_implementation(&abs, n) {
-                                response_value = Some(json!({
-                                    "content": [{
-                                        "type": "text",
-                                        "text": serde_json::to_string(&ast).unwrap_or_default()
-                                    }]
-                                }));
-                            } else {
-                                error_value = Some(json!({
-                                    "code": -32603,
-                                    "message": "Failed to extract implementation"
-                                }));
+                            match skeleton::get_implementation(&abs, n) {
+                                Ok(skeleton::ImplLookup::Found(source)) => {
+                                    response_value = Some(json!({
+                                        "content": [{ "type": "text", "text": source }]
+                                    }));
+                                }
+                                Ok(skeleton::ImplLookup::NotFound(candidates)) => {
+                                    response_value = Some(json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!(
+                                                "Node '{}' not found in {}. Available top-level symbols: {}",
+                                                n, p, candidates.join(", ")
+                                            )
+                                        }],
+                                        "isError": true
+                                    }));
+                                }
+                                Err(e) => {
+                                    response_value = Some(json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!("Failed to extract implementation: {}", e)
+                                        }],
+                                        "isError": true
+                                    }));
+                                }
                             }
                         }
                     }
