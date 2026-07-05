@@ -6,6 +6,13 @@ use std::sync::Arc;
 use crate::graph::AppState;
 use crate::skeleton;
 
+pub const GLOBAL_URI: &str = "skeleton://project/global";
+const FILE_URI_PREFIX: &str = "skeleton://project/file/";
+
+pub fn file_uri(key: &str) -> String {
+    format!("{}{}", FILE_URI_PREFIX, key)
+}
+
 // --- MCP PROTOCOL STRUCTURES ---
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -81,7 +88,7 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
         }
         "resources/list" => {
             let mut resources = vec![json!({
-                "uri": "skeleton://project/global",
+                "uri": GLOBAL_URI,
                 "name": "Global Semantic Skeleton",
                 "mimeType": "application/json"
             })];
@@ -89,7 +96,7 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
             for entry in state.skeleton_graph.iter() {
                 let path = entry.key();
                 resources.push(json!({
-                    "uri": format!("skeleton://project/file/{}", path),
+                    "uri": file_uri(path),
                     "name": format!("Semantic Skeleton for {}", path),
                     "mimeType": "application/json"
                 }));
@@ -100,7 +107,7 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
         "resources/read" => {
             if let Some(params) = req.params {
                 if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
-                    if uri == "skeleton://project/global" {
+                    if uri == GLOBAL_URI {
                         if state.skeleton_graph.is_empty() {
                             error_value = Some(json!({
                                 "code": -32603,
@@ -113,15 +120,16 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                             }
                             response_value = Some(json!({
                                 "contents": [{
-                                    "uri": "skeleton://project/global",
+                                    "uri": GLOBAL_URI,
                                     "mimeType": "application/json",
                                     "text": serde_json::to_string(&graph).unwrap_or_default()
                                 }]
                             }));
                         }
-                    } else if uri.starts_with("skeleton://project/file/") {
-                        let path = uri.trim_start_matches("skeleton://project/file/");
-                        if let Some(file_skeleton) = state.skeleton_graph.get(path) {
+                    } else if uri.starts_with(FILE_URI_PREFIX) {
+                        let path = uri.trim_start_matches(FILE_URI_PREFIX);
+                        let key = state.key_for(path).unwrap_or_else(|| path.to_string());
+                        if let Some(file_skeleton) = state.skeleton_graph.get(&key) {
                             response_value = Some(json!({
                                 "contents": [{
                                     "uri": uri,
@@ -186,7 +194,11 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                                 .get("target_node")
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("");
-                            if let Ok(ast) = skeleton::get_implementation(p, n) {
+                            let abs = state
+                                .key_for(p)
+                                .map(|k| state.abs_path(&k))
+                                .unwrap_or_else(|| std::path::PathBuf::from(p));
+                            if let Ok(ast) = skeleton::get_implementation(&abs, n) {
                                 response_value = Some(json!({
                                     "content": [{
                                         "type": "text",
@@ -204,7 +216,8 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                     "list_functions" => {
                         if let Some(args) = args {
                             let p = args.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
-                            if let Some(file_skeleton) = state.skeleton_graph.get(p) {
+                            let key = state.key_for(p).unwrap_or_else(|| p.to_string());
+                            if let Some(file_skeleton) = state.skeleton_graph.get(&key) {
                                 response_value = Some(json!({
                                     "content": [{
                                         "type": "text",

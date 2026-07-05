@@ -122,10 +122,9 @@ pub fn skeletonize_file(path: &Path) -> Result<FileSkeleton> {
     skeletonize_source(&source_text, path)
 }
 
-pub fn get_implementation(path: &str, _target_node: &str) -> Result<serde_json::Value> {
+pub fn get_implementation(path: &Path, _target_node: &str) -> Result<serde_json::Value> {
     let allocator = Allocator::default();
-    let path_buf = std::path::PathBuf::from(path);
-    let source_text = std::fs::read_to_string(&path_buf)?;
-    let program = parse_source(&allocator, &source_text, &path_buf)?;
+    let source_text = std::fs::read_to_string(path)?;
+    let program = parse_source(&allocator, &source_text, path)?;
     Ok(serde_json::json!(format!("{:#?}", program)))
 }

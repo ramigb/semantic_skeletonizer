@@ -5,8 +5,9 @@ mod resolve;
 mod skeleton;
 mod watcher;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,21 +15,55 @@ use tokio::sync::mpsc;
 
 use graph::{perform_initial_sweep, AppState};
 use protocol::{Notification, Request};
+use watcher::ChangeSet;
+
+fn parse_root_arg() -> Result<PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    let root = match args.iter().position(|a| a == "--root") {
+        Some(i) => PathBuf::from(
+            args.get(i + 1)
+                .context("--root requires a directory argument")?,
+        ),
+        None => std::env::current_dir()?,
+    };
+    root.canonicalize()
+        .with_context(|| format!("cannot resolve root directory {}", root.display()))
+}
+
+async fn write_notification(
+    stdout: &mut tokio::io::Stdout,
+    state: &Arc<AppState>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let notif = Notification {
+        jsonrpc: "2.0".to_string(),
+        method: method.to_string(),
+        params,
+    };
+    let out = format!("{}\n", serde_json::to_string(&notif)?);
+    state.add_log("OUT", json!(notif));
+    tokio::io::AsyncWriteExt::write_all(stdout, out.as_bytes()).await?;
+    stdout.flush().await?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
-    let state = Arc::new(AppState::new());
+    let root = parse_root_arg()?;
+    let state = Arc::new(AppState::new(root));
 
-    // PERFORM INITIAL SWEEP IN BACKGROUND
+    // Sweep synchronously so the graph is fully populated before the first
+    // request arrives (parse work stays off the reactor).
     let sweep_state = state.clone();
-    tokio::spawn(async move {
-        perform_initial_sweep(&sweep_state);
-        sweep_state.add_log("SYS", json!({"event": "initial_sweep_complete"}));
-    });
+    tokio::task::spawn_blocking(move || perform_initial_sweep(&sweep_state))
+        .await
+        .context("initial sweep panicked")?;
+    state.add_log("SYS", json!({"event": "initial_sweep_complete"}));
 
-    let (notify_tx, mut notify_rx) = mpsc::channel::<()>(100);
+    let (notify_tx, mut notify_rx) = mpsc::channel::<ChangeSet>(100);
 
     let watcher_state = state.clone();
     tokio::spawn(async move {
@@ -61,16 +96,32 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(_) = notify_rx.recv() => {
-                let notif = Notification {
-                    jsonrpc: "2.0".to_string(),
-                    method: "notifications/resources/updated".to_string(),
-                    params: json!({"uri": "skeleton://project/global"}),
-                };
-                let out = format!("{}\n", serde_json::to_string(&notif)?);
-                state.add_log("OUT", json!(notif));
-                stdout.write_all(out.as_bytes()).await?;
-                stdout.flush().await?;
+            Some(changes) = notify_rx.recv() => {
+                for key in changes.updated.iter().chain(changes.added.iter()) {
+                    write_notification(
+                        &mut stdout,
+                        &state,
+                        "notifications/resources/updated",
+                        json!({"uri": protocol::file_uri(key)}),
+                    )
+                    .await?;
+                }
+                write_notification(
+                    &mut stdout,
+                    &state,
+                    "notifications/resources/updated",
+                    json!({"uri": protocol::GLOBAL_URI}),
+                )
+                .await?;
+                if !changes.added.is_empty() || !changes.removed.is_empty() {
+                    write_notification(
+                        &mut stdout,
+                        &state,
+                        "notifications/resources/list_changed",
+                        json!({}),
+                    )
+                    .await?;
+                }
             }
 
             res = stdin.read_line(&mut line) => {
