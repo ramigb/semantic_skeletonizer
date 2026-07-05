@@ -23,6 +23,9 @@ pub struct ChangeSet {
     pub added: Vec<String>,
     /// Keys removed from the graph.
     pub removed: Vec<String>,
+    /// Force a list_changed push even with no added/removed keys (used to
+    /// announce initial-sweep completion, including on empty projects).
+    pub force_list_changed: bool,
 }
 
 impl ChangeSet {

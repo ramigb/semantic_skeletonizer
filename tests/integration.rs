@@ -83,11 +83,32 @@ impl Server {
             rx,
             next_id: 1,
         };
-        let init = server.request(
-            "initialize",
-            json!({"protocolVersion": "2025-03-26", "capabilities": {}}),
+        // The sweep runs in the background (initialize answers immediately)
+        // and announces completion with list_changed — the two can arrive in
+        // either order.
+        let id = server.next_id;
+        server.next_id += 1;
+        server.send_raw(
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {}}
+            })
+            .to_string(),
         );
-        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut got_init, mut got_sweep) = (false, false);
+        while !(got_init && got_sweep) {
+            assert!(Instant::now() < deadline, "initialize or initial sweep never completed");
+            let Some(v) = server.recv(Duration::from_millis(200)) else {
+                continue;
+            };
+            if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
+                got_init = true;
+            } else if v["method"] == "notifications/resources/list_changed" {
+                got_sweep = true;
+            }
+        }
         server
     }
 

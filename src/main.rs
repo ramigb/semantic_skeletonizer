@@ -55,15 +55,36 @@ async fn main() -> Result<()> {
     let root = parse_root_arg()?;
     let state = Arc::new(AppState::new(root));
 
-    // Sweep synchronously so the graph is fully populated before the first
-    // request arrives (parse work stays off the reactor).
-    let sweep_state = state.clone();
-    tokio::task::spawn_blocking(move || perform_initial_sweep(&sweep_state))
-        .await
-        .context("initial sweep panicked")?;
-    state.add_log("SYS", json!({"event": "initial_sweep_complete"}));
-
     let (notify_tx, mut notify_rx) = mpsc::channel::<ChangeSet>(100);
+
+    // Sweep in the background so `initialize` is answered immediately —
+    // MCP clients enforce startup timeouts, and a large or slow tree can
+    // take a while. A list_changed notification announces completion.
+    let sweep_state = state.clone();
+    let sweep_tx = notify_tx.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let walk_state = sweep_state.clone();
+        let added = tokio::task::spawn_blocking(move || perform_initial_sweep(&walk_state))
+            .await
+            .unwrap_or_default();
+        eprintln!(
+            "[semantic-skeletonizer] initial sweep: {} files in {:.2?}",
+            added.len(),
+            started.elapsed()
+        );
+        sweep_state.add_log(
+            "SYS",
+            json!({"event": "initial_sweep_complete", "files": added.len()}),
+        );
+        let _ = sweep_tx
+            .send(ChangeSet {
+                added,
+                force_list_changed: true,
+                ..ChangeSet::default()
+            })
+            .await;
+    });
 
     let watcher_state = state.clone();
     tokio::spawn(async move {
@@ -122,7 +143,10 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                if !changes.added.is_empty() || !changes.removed.is_empty() {
+                if changes.force_list_changed
+                    || !changes.added.is_empty()
+                    || !changes.removed.is_empty()
+                {
                     write_notification(
                         &mut stdout,
                         &state,

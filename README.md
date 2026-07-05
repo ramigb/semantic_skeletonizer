@@ -86,7 +86,7 @@ For **Claude Desktop**, edit `claude_desktop_config.json` (`~/Library/Applicatio
 }
 ```
 
-Without `--root`, the server watches the working directory it is spawned in. The initial sweep completes before the first request is answered.
+Without `--root`, the server watches the working directory it is spawned in. `initialize` is answered immediately; the graph populates in the background and a `notifications/resources/list_changed` push announces when the initial sweep is complete (sweep duration and file count are also logged to stderr).
 
 ### 3. Run the tests
 ```bash

@@ -254,8 +254,18 @@ mod tests {
     }
 }
 
-pub fn perform_initial_sweep(state: &Arc<AppState>) {
-    for entry in WalkBuilder::new(&state.root).build().flatten() {
+/// Walk the root and skeletonize every tracked .ts/.tsx file. Returns the
+/// keys added. `.git/` and `node_modules/` are pruned during descent — on
+/// large or slow filesystems, even visiting their entries is expensive.
+pub fn perform_initial_sweep(state: &Arc<AppState>) -> Vec<String> {
+    let mut added = Vec::new();
+    let walker = WalkBuilder::new(&state.root)
+        .filter_entry(|e| {
+            let name = e.file_name().to_str().unwrap_or("");
+            name != ".git" && name != "node_modules"
+        })
+        .build();
+    for entry in walker.flatten() {
         let path = entry.path();
         if path.is_file() && is_skeleton_target(path) && !state.is_ignored(path) {
             let Some(key) = canonical_key(&state.root, path) else {
@@ -263,7 +273,8 @@ pub fn perform_initial_sweep(state: &Arc<AppState>) {
             };
             match skeletonize_file(path) {
                 Ok(ir) => {
-                    state.upsert(key, ir);
+                    state.upsert(key.clone(), ir);
+                    added.push(key);
                 }
                 Err(e) => {
                     tracing::warn!("initial sweep: skipping {}: {}", path.display(), e);
@@ -271,4 +282,5 @@ pub fn perform_initial_sweep(state: &Arc<AppState>) {
             }
         }
     }
+    added
 }
