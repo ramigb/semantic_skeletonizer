@@ -21,6 +21,19 @@ pub struct FileSkeleton {
     pub classes: Vec<String>,
     pub variables: Vec<String>,
     pub symbols: Vec<SymbolInfo>,
+    /// Structured import records (source specifier as written).
+    pub import_records: Vec<ImportRecord>,
+    /// Resolved graph keys this file imports (filled in by the graph layer).
+    pub dependencies: Vec<String>,
+    /// Bare (package) specifiers this file imports.
+    pub external_deps: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImportRecord {
+    pub source: String,
+    pub names: Vec<String>,
+    pub type_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -268,14 +281,63 @@ fn collect_symbols(program: &Program<'_>, ctx: &SymbolContext) -> Vec<SymbolInfo
     out
 }
 
+fn import_record(decl: &ImportDeclaration<'_>) -> ImportRecord {
+    let names = decl
+        .specifiers
+        .as_ref()
+        .map(|specs| {
+            specs
+                .iter()
+                .map(|s| match s {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => s.local.name.to_string(),
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                        s.local.name.to_string()
+                    }
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                        s.local.name.to_string()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ImportRecord {
+        source: decl.source.value.to_string(),
+        names,
+        type_only: decl.import_kind.is_type(),
+    }
+}
+
 fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
     let mut ir = FileSkeleton::default();
     for stmt in &program.body {
         match stmt {
-            Statement::ImportDeclaration(decl) => ir.imports.push(stringify_item(&**decl)),
-            Statement::ExportNamedDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::ImportDeclaration(decl) => {
+                ir.imports.push(stringify_item(&**decl));
+                ir.import_records.push(import_record(decl));
+            }
+            Statement::ExportNamedDeclaration(decl) => {
+                ir.exports.push(stringify_item(&**decl));
+                if let Some(src) = &decl.source {
+                    ir.import_records.push(ImportRecord {
+                        source: src.value.to_string(),
+                        names: decl
+                            .specifiers
+                            .iter()
+                            .map(|s| s.exported.name().to_string())
+                            .collect(),
+                        type_only: decl.export_kind.is_type(),
+                    });
+                }
+            }
             Statement::ExportDefaultDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
-            Statement::ExportAllDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::ExportAllDeclaration(decl) => {
+                ir.exports.push(stringify_item(&**decl));
+                ir.import_records.push(ImportRecord {
+                    source: decl.source.value.to_string(),
+                    names: vec!["*".to_string()],
+                    type_only: decl.export_kind.is_type(),
+                });
+            }
             Statement::TSImportEqualsDeclaration(decl) => ir.imports.push(stringify_item(&**decl)),
             Statement::TSExportAssignment(decl) => ir.exports.push(stringify_item(&**decl)),
             Statement::TSNamespaceExportDeclaration(decl) => {

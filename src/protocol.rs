@@ -190,6 +190,18 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                         }
                     },
                     {
+                        "name": "get_dependencies",
+                        "description": "Resolved import edges for a file: which files it imports, which files import it, and its external packages.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": { "type": "string" },
+                                "direction": { "type": "string", "enum": ["in", "out", "both"], "description": "Edge direction to include (default both)." }
+                            },
+                            "required": ["file_path"]
+                        }
+                    },
+                    {
                         "name": "search_symbols",
                         "description": "Case-insensitive substring search for symbol names across the whole graph. Returns [{file, name, kind}].",
                         "inputSchema": {
@@ -267,6 +279,40 @@ pub async fn handle_request(state: &Arc<AppState>, req: Request) -> Option<Respo
                                     "content": [{
                                         "type": "text",
                                         "text": serde_json::to_string(&symbols).unwrap_or_default()
+                                    }]
+                                }));
+                            } else {
+                                response_value = Some(json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("File not found in graph: {}", p)
+                                    }],
+                                    "isError": true
+                                }));
+                            }
+                        }
+                    }
+                    "get_dependencies" => {
+                        if let Some(args) = args {
+                            let p = args.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
+                            let direction = args
+                                .get("direction")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("both");
+                            let key = state.key_for(p).unwrap_or_else(|| p.to_string());
+                            if let Some(node) = state.skeleton_graph.get(&key) {
+                                let mut out = serde_json::Map::new();
+                                if direction == "out" || direction == "both" {
+                                    out.insert("imports".into(), json!(node.dependencies));
+                                    out.insert("external".into(), json!(node.external_deps));
+                                }
+                                if direction == "in" || direction == "both" {
+                                    out.insert("imported_by".into(), json!(state.dependents_of(&key)));
+                                }
+                                response_value = Some(json!({
+                                    "content": [{
+                                        "type": "text",
+                                        "text": serde_json::to_string(&out).unwrap_or_default()
                                     }]
                                 }));
                             } else {

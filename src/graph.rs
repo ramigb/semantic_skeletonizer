@@ -9,6 +9,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::collections::HashSet;
+
+use crate::resolve::{FsResolver, Resolution, Resolver};
 use crate::skeleton::{skeletonize_file, FileSkeleton};
 
 /// Normalize `p` (absolute, or relative to `root`) into the graph's canonical
@@ -72,7 +75,10 @@ pub struct LogEntry {
 pub struct AppState {
     pub root: PathBuf,
     pub gitignore: Gitignore,
+    pub resolver: Box<dyn Resolver>,
     pub skeleton_graph: DashMap<String, FileSkeleton>,
+    /// Reverse dependency index: key -> set of files importing it.
+    pub dependents: DashMap<String, HashSet<String>>,
     pub logs: RwLock<VecDeque<LogEntry>>,
     pub uptime_acc: RwLock<Duration>,
     pub uptime_start: RwLock<Option<Instant>>,
@@ -88,7 +94,9 @@ impl AppState {
         Self {
             root,
             gitignore,
+            resolver: Box::new(FsResolver),
             skeleton_graph: DashMap::new(),
+            dependents: DashMap::new(),
             logs: RwLock::new(VecDeque::new()),
             uptime_acc: RwLock::new(Duration::ZERO),
             uptime_start: RwLock::new(Some(Instant::now())),
@@ -124,14 +132,68 @@ impl AppState {
             .is_ignore()
     }
 
-    /// Insert or replace a node. Returns `true` when the key is new.
-    pub fn upsert(&self, key: String, skeleton: FileSkeleton) -> bool {
-        self.skeleton_graph.insert(key, skeleton).is_none()
+    /// Insert or replace a node, resolving its import records into graph
+    /// edges and maintaining the reverse-dependency index.
+    /// Returns `true` when the key is new.
+    pub fn upsert(&self, key: String, mut skeleton: FileSkeleton) -> bool {
+        let mut deps = Vec::new();
+        let mut externals = Vec::new();
+        for record in &skeleton.import_records {
+            match self.resolver.resolve(&self.root, &key, &record.source) {
+                Resolution::Internal(k) if k != key => deps.push(k),
+                Resolution::External(pkg) => externals.push(pkg),
+                _ => {}
+            }
+        }
+        deps.sort();
+        deps.dedup();
+        externals.sort();
+        externals.dedup();
+        skeleton.dependencies = deps.clone();
+        skeleton.external_deps = externals;
+
+        let old = self.skeleton_graph.insert(key.clone(), skeleton);
+        if let Some(old) = &old {
+            for gone in old.dependencies.iter().filter(|d| !deps.contains(d)) {
+                if let Some(mut set) = self.dependents.get_mut(gone) {
+                    set.remove(&key);
+                }
+            }
+        }
+        for dep in &deps {
+            self.dependents
+                .entry(dep.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        old.is_none()
     }
 
-    /// Remove a node. Returns `true` when it existed.
+    /// Remove a node and its outgoing edges from the reverse-dependency
+    /// index. Returns `true` when it existed.
     pub fn remove(&self, key: &str) -> bool {
-        self.skeleton_graph.remove(key).is_some()
+        match self.skeleton_graph.remove(key) {
+            Some((_, old)) => {
+                for dep in &old.dependencies {
+                    if let Some(mut set) = self.dependents.get_mut(dep) {
+                        set.remove(key);
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Files that import `key`, from the reverse index.
+    pub fn dependents_of(&self, key: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .dependents
+            .get(key)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        v.sort();
+        v
     }
 
     pub fn add_log(&self, direction: &str, payload: Value) {
