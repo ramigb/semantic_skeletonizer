@@ -62,7 +62,22 @@ impl<'a> VisitMut<'a> for Skeletonizer {
 
     fn visit_arrow_function_expression(&mut self, expr: &mut ArrowFunctionExpression<'a>) {
         expr.body.statements.clear();
+        // An expression-bodied arrow (`() => x`) with its body cleared must
+        // become a block arrow, or codegen emits the invalid `() =>`.
+        expr.expression = false;
         oxc_ast_visit::walk_mut::walk_arrow_function_expression(self, expr);
+    }
+
+    fn visit_property_definition(&mut self, prop: &mut PropertyDefinition<'a>) {
+        // Clear only function-valued initializers; type annotations and plain
+        // value initializers stay.
+        if matches!(
+            prop.value,
+            Some(Expression::ArrowFunctionExpression(_)) | Some(Expression::FunctionExpression(_))
+        ) {
+            prop.value = None;
+        }
+        oxc_ast_visit::walk_mut::walk_property_definition(self, prop);
     }
 
     fn visit_program(&mut self, program: &mut Program<'a>) {
@@ -200,11 +215,16 @@ fn collect_decl_symbols(
                     Some(Expression::FunctionExpression(_)) => "function",
                     _ => "variable",
                 };
+                let decl_text = if elidable_init_size(d).is_some() {
+                    declarator_text(d, ctx)
+                } else {
+                    stringify_item(d)
+                };
                 out.push(SymbolInfo {
                     name: name.to_string(),
                     kind: kind.to_string(),
                     exported,
-                    signature: one_line(&format!("{} {}", v.kind.as_str(), stringify_item(d))),
+                    signature: one_line(&format!("{} {}", v.kind.as_str(), decl_text)),
                 });
             }
         }
@@ -307,16 +327,83 @@ fn import_record(decl: &ImportDeclaration<'_>) -> ImportRecord {
     }
 }
 
+/// Object/array literal initializers above this byte size are elided from the
+/// skeleton; smaller ones (regexes, constants, small configs) are signal.
+const ELIDE_THRESHOLD: usize = 200;
+
+fn elidable_init_size(d: &VariableDeclarator<'_>) -> Option<usize> {
+    let span = match &d.init {
+        Some(Expression::ObjectExpression(o)) => o.span,
+        Some(Expression::ArrayExpression(a)) => a.span,
+        _ => return None,
+    };
+    let size = (span.end - span.start) as usize;
+    (size > ELIDE_THRESHOLD).then_some(size)
+}
+
+/// Per-declarator skeleton text with oversized object/array literal
+/// initializers elided as `NAME: <annotation> = /* elided: N bytes */`.
+fn declarator_text(d: &VariableDeclarator<'_>, ctx: &SymbolContext) -> String {
+    let src = ctx.source_text;
+    let id_start = d.id.span().start as usize;
+    let id_end = d
+        .type_annotation
+        .as_ref()
+        .map(|a| a.span().end)
+        .unwrap_or(d.id.span().end) as usize;
+    let head = &src[id_start..id_end];
+    match (elidable_init_size(d), &d.init) {
+        (Some(n), _) => format!("{} = /* elided: {} bytes */", head, n),
+        (None, Some(init)) => {
+            let s = init.span();
+            format!("{} = {}", head, &src[s.start as usize..s.end as usize])
+        }
+        (None, None) => head.to_string(),
+    }
+}
+
+/// Skeleton text for a whole variable declaration.
+fn variable_decl_text(v: &VariableDeclaration<'_>, exported: bool, ctx: &SymbolContext) -> String {
+    let export_prefix = if exported { "export " } else { "" };
+    if !v.declarations.iter().any(|d| elidable_init_size(d).is_some()) {
+        return format!("{}{}", export_prefix, stringify_item(v));
+    }
+    let parts: Vec<String> = v
+        .declarations
+        .iter()
+        .map(|d| declarator_text(d, ctx))
+        .collect();
+    format!("{}{} {};", export_prefix, v.kind.as_str(), parts.join(", "))
+}
+
+/// Prepend the JSDoc block attached to the statement, if any, so `/** ... */`
+/// docs survive skeletonization.
+fn with_jsdoc(program: &Program<'_>, ctx: &SymbolContext, attach_point: u32, body: String) -> String {
+    for c in &program.comments {
+        if c.is_jsdoc() && c.attached_to == attach_point {
+            let doc = &ctx.source_text[c.span.start as usize..c.span.end as usize];
+            return format!("{}\n{}", doc, body);
+        }
+    }
+    body
+}
+
 fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
     let mut ir = FileSkeleton::default();
     for stmt in &program.body {
+        let start = stmt.span().start;
+        let doc = |body: String| with_jsdoc(program, ctx, start, body);
         match stmt {
             Statement::ImportDeclaration(decl) => {
                 ir.imports.push(stringify_item(&**decl));
                 ir.import_records.push(import_record(decl));
             }
             Statement::ExportNamedDeclaration(decl) => {
-                ir.exports.push(stringify_item(&**decl));
+                let text = match &decl.declaration {
+                    Some(Declaration::VariableDeclaration(v)) => variable_decl_text(v, true, ctx),
+                    _ => stringify_item(&**decl),
+                };
+                ir.exports.push(doc(text));
                 if let Some(src) = &decl.source {
                     ir.import_records.push(ImportRecord {
                         source: src.value.to_string(),
@@ -329,7 +416,9 @@ fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
                     });
                 }
             }
-            Statement::ExportDefaultDeclaration(decl) => ir.exports.push(stringify_item(&**decl)),
+            Statement::ExportDefaultDeclaration(decl) => {
+                ir.exports.push(doc(stringify_item(&**decl)))
+            }
             Statement::ExportAllDeclaration(decl) => {
                 ir.exports.push(stringify_item(&**decl));
                 ir.import_records.push(ImportRecord {
@@ -344,13 +433,19 @@ fn extract_ir(program: &Program<'_>, ctx: &SymbolContext) -> FileSkeleton {
                 ir.exports.push(stringify_item(&**decl))
             }
 
-            Statement::ClassDeclaration(decl) => ir.classes.push(stringify_item(&**decl)),
-            Statement::FunctionDeclaration(decl) => ir.functions.push(stringify_item(&**decl)),
-            Statement::VariableDeclaration(decl) => ir.variables.push(stringify_item(&**decl)),
-            Statement::TSInterfaceDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
-            Statement::TSTypeAliasDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
-            Statement::TSEnumDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
-            Statement::TSModuleDeclaration(decl) => ir.interfaces.push(stringify_item(&**decl)),
+            Statement::ClassDeclaration(decl) => ir.classes.push(doc(stringify_item(&**decl))),
+            Statement::FunctionDeclaration(decl) => ir.functions.push(doc(stringify_item(&**decl))),
+            Statement::VariableDeclaration(decl) => {
+                ir.variables.push(doc(variable_decl_text(decl, false, ctx)))
+            }
+            Statement::TSInterfaceDeclaration(decl) => {
+                ir.interfaces.push(doc(stringify_item(&**decl)))
+            }
+            Statement::TSTypeAliasDeclaration(decl) => {
+                ir.interfaces.push(doc(stringify_item(&**decl)))
+            }
+            Statement::TSEnumDeclaration(decl) => ir.interfaces.push(doc(stringify_item(&**decl))),
+            Statement::TSModuleDeclaration(decl) => ir.interfaces.push(doc(stringify_item(&**decl))),
 
             _ => {}
         }
