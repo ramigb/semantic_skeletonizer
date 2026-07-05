@@ -12,6 +12,7 @@ Parsing is done with [oxc](https://oxc.rs). As files change, a background watche
 
 ## Table of Contents
 - [Measured Token Savings](#measured-token-savings)
+- [Agent Skills](#agent-skills)
 - [Features](#features)
 - [Architecture Overview](#architecture-overview)
 - [Setup & Installation](#setup--installation)
@@ -34,6 +35,12 @@ Measured against real OSS repos (shallow clones, all tracked `.ts`/`.tsx` files)
 Savings scale with how much implementation code a repo has. Implementation-heavy code (zustand) compresses ~70%; mixed code (zod) ~45%; a **types-only** repo like type-fest gets *negative* savings — types are preserved verbatim by design, so the JSON envelope only adds overhead. If your codebase is mostly type declarations, read files directly instead.
 
 Reproduce with `scripts/bench.py <repo-dir>` — or measure your own repo before trusting any number here.
+
+---
+
+## Agent Skills
+
+The server is deliberately a data plane; the analysis lives in the agent. [`skills/`](skills/README.md) ships eleven ready-made skills that turn the graph into reports — blast-radius impact analysis, circular-dependency detection, dead-export hunting, architecture diagrams, API docs generation, a guided codebase tour, and more. Copy them into your project's `.claude/skills/` and they trigger on questions like *"what breaks if I change `api.ts`?"*.
 
 ---
 
