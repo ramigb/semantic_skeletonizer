@@ -642,3 +642,122 @@ pub fn top_level_names(program: &Program<'_>) -> Vec<String> {
     }
     names
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skel(source: &str, name: &str) -> FileSkeleton {
+        skeletonize_source(source, Path::new(name)).unwrap()
+    }
+
+    #[test]
+    fn arrow_function_components_are_detected() {
+        let src = r#"
+import React from 'react';
+export interface FormProps { onSubmit: () => void; }
+export const Form = (props: FormProps) => {
+  return <div />;
+};
+const helper = () => 42;
+"#;
+        let ir = skel(src, "Form.tsx");
+        let form = ir.symbols.iter().find(|s| s.name == "Form").unwrap();
+        assert_eq!(form.kind, "component");
+        assert!(form.exported);
+        let helper = ir.symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert_eq!(helper.kind, "arrow_function");
+        assert!(!helper.exported);
+        assert!(ir.symbols.iter().any(|s| s.name == "FormProps" && s.kind == "interface"));
+    }
+
+    #[test]
+    fn fc_annotation_marks_component_even_without_pascal_case_body() {
+        let src = "import { FC } from 'react';\nexport const widget: FC<{}> = () => null;\n";
+        let ir = skel(src, "widget.tsx");
+        let w = ir.symbols.iter().find(|s| s.name == "widget").unwrap();
+        assert_eq!(w.kind, "component");
+    }
+
+    #[test]
+    fn function_bodies_are_stripped_but_signatures_survive() {
+        let src = "export function validate(u: string): boolean {\n  const x = u.trim();\n  return x.length > 0;\n}\n";
+        let ir = skel(src, "api.ts");
+        assert_eq!(ir.exports.len(), 1);
+        assert!(ir.exports[0].contains("validate(u: string): boolean"));
+        assert!(!ir.exports[0].contains("trim"));
+    }
+
+    #[test]
+    fn import_records_capture_names_and_type_only() {
+        let src = "import React from 'react';\nimport type { User } from './types';\nimport { a, b } from '../lib/util';\nimport './styles.css';\nexport * from './re';\n";
+        let ir = skel(src, "x.ts");
+        let sources: Vec<&str> = ir.import_records.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(sources, vec!["react", "./types", "../lib/util", "./re"]);
+        assert!(ir.import_records[1].type_only);
+        assert_eq!(ir.import_records[2].names, vec!["a", "b"]);
+        assert_eq!(ir.import_records[3].names, vec!["*"]);
+    }
+
+    #[test]
+    fn oversized_literals_are_elided_small_ones_kept() {
+        let big: String = (0..100)
+            .map(|i| format!("{{ id: {}, name: \"row-{}\" }}", i, i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!(
+            "export const TABLE: Row[] = [{}];\nexport const RE = /^[a-z]+$/;\n",
+            big
+        );
+        let ir = skel(&src, "data.ts");
+        let table = ir.exports.iter().find(|e| e.contains("TABLE")).unwrap();
+        assert!(table.contains("elided:"), "got: {}", table);
+        assert!(table.len() < 200);
+        assert!(table.contains("Row[]"));
+        let re = ir.exports.iter().find(|e| e.contains("RE")).unwrap();
+        assert!(re.contains("/^[a-z]+$/"));
+    }
+
+    #[test]
+    fn jsdoc_blocks_survive_skeletonization() {
+        let src = "/**\n * Frobnicates the widget.\n */\nexport function frob(): void {\n  console.log('x');\n}\n";
+        let ir = skel(src, "frob.ts");
+        assert!(ir.exports[0].starts_with("/**"));
+        assert!(ir.exports[0].contains("Frobnicates the widget."));
+        assert!(!ir.exports[0].contains("console.log"));
+    }
+
+    #[test]
+    fn class_property_function_initializers_cleared_values_kept() {
+        let src = "export class S {\n  name: string = 'svc';\n  fn = (x: number) => {\n    return x * 2;\n  };\n}\n";
+        let ir = skel(src, "s.ts");
+        let c = &ir.exports[0];
+        assert!(c.contains("name: string"));
+        assert!(c.contains("svc"));
+        assert!(!c.contains("x * 2"));
+    }
+
+    #[test]
+    fn get_implementation_slices_original_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("api.ts");
+        let func = "export function hi(): string {\n  // greet\n  return 'hi';\n}";
+        std::fs::write(&f, format!("const pad = 1;\n{}\nclass C {{ m() {{ return 2; }} }}\n", func)).unwrap();
+
+        match get_implementation(&f, "hi").unwrap() {
+            ImplLookup::Found(s) => assert_eq!(s, func),
+            _ => panic!("expected Found"),
+        }
+        match get_implementation(&f, "C.m").unwrap() {
+            ImplLookup::Found(s) => assert_eq!(s, "m() { return 2; }"),
+            _ => panic!("expected Found for C.m"),
+        }
+        match get_implementation(&f, "nope").unwrap() {
+            ImplLookup::NotFound(c) => {
+                assert!(c.contains(&"hi".to_string()));
+                assert!(c.contains(&"C.m".to_string()));
+            }
+            _ => panic!("expected NotFound"),
+        }
+    }
+}

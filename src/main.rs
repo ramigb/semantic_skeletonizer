@@ -90,29 +90,38 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut stdin = BufReader::new(tokio::io::stdin());
+    // `next_line()` is cancellation-safe: a pushed notification racing in the
+    // select loop can no longer drop partially-read request bytes.
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
-    let mut line = String::new();
 
     loop {
         tokio::select! {
             Some(changes) = notify_rx.recv() => {
+                let subs = state.subscriptions.read().unwrap().clone();
+                // Per-URI `updated` pushes go only to subscribed URIs;
+                // `list_changed` is always allowed.
                 for key in changes.updated.iter().chain(changes.added.iter()) {
+                    let uri = protocol::file_uri(key);
+                    if subs.contains(&uri) {
+                        write_notification(
+                            &mut stdout,
+                            &state,
+                            "notifications/resources/updated",
+                            json!({"uri": uri}),
+                        )
+                        .await?;
+                    }
+                }
+                if subs.contains(protocol::GLOBAL_URI) {
                     write_notification(
                         &mut stdout,
                         &state,
                         "notifications/resources/updated",
-                        json!({"uri": protocol::file_uri(key)}),
+                        json!({"uri": protocol::GLOBAL_URI}),
                     )
                     .await?;
                 }
-                write_notification(
-                    &mut stdout,
-                    &state,
-                    "notifications/resources/updated",
-                    json!({"uri": protocol::GLOBAL_URI}),
-                )
-                .await?;
                 if !changes.added.is_empty() || !changes.removed.is_empty() {
                     write_notification(
                         &mut stdout,
@@ -124,11 +133,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            res = stdin.read_line(&mut line) => {
-                let bytes_read = res?;
-                if bytes_read == 0 {
+            res = lines.next_line() => {
+                let Some(line) = res? else {
                     break;
-                }
+                };
 
                 if let Ok(req) = serde_json::from_str::<Request>(&line) {
                     if !state.is_running.load(Ordering::SeqCst) {
@@ -138,7 +146,6 @@ async fn main() -> Result<()> {
                         state.add_log("OUT", json!(err_res));
                         stdout.write_all(out.as_bytes()).await?;
                         stdout.flush().await?;
-                        line.clear();
                         continue;
                     }
 
@@ -156,7 +163,6 @@ async fn main() -> Result<()> {
                     stdout.write_all(out.as_bytes()).await?;
                     stdout.flush().await?;
                 }
-                line.clear();
             }
         }
     }

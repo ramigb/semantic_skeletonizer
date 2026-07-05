@@ -79,6 +79,8 @@ pub struct AppState {
     pub skeleton_graph: DashMap<String, FileSkeleton>,
     /// Reverse dependency index: key -> set of files importing it.
     pub dependents: DashMap<String, HashSet<String>>,
+    /// Resource URIs the client subscribed to via resources/subscribe.
+    pub subscriptions: RwLock<HashSet<String>>,
     pub logs: RwLock<VecDeque<LogEntry>>,
     pub uptime_acc: RwLock<Duration>,
     pub uptime_start: RwLock<Option<Instant>>,
@@ -97,6 +99,7 @@ impl AppState {
             resolver: Box::new(FsResolver),
             skeleton_graph: DashMap::new(),
             dependents: DashMap::new(),
+            subscriptions: RwLock::new(HashSet::new()),
             logs: RwLock::new(VecDeque::new()),
             uptime_acc: RwLock::new(Duration::ZERO),
             uptime_start: RwLock::new(Some(Instant::now())),
@@ -209,6 +212,45 @@ impl AppState {
             direction: direction.to_string(),
             payload,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_key_normalizes_everything_to_root_relative() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            canonical_key(root, Path::new("src/x.ts")).as_deref(),
+            Some("src/x.ts")
+        );
+        assert_eq!(
+            canonical_key(root, Path::new("./src/x.ts")).as_deref(),
+            Some("src/x.ts")
+        );
+        assert_eq!(
+            canonical_key(root, Path::new("/repo/./src/x.ts")).as_deref(),
+            Some("src/x.ts")
+        );
+        assert_eq!(
+            canonical_key(root, Path::new("src/sub/../x.ts")).as_deref(),
+            Some("src/x.ts")
+        );
+        assert_eq!(
+            canonical_key(root, Path::new("/repo/src/x.ts")).as_deref(),
+            Some("src/x.ts")
+        );
+    }
+
+    #[test]
+    fn canonical_key_rejects_paths_outside_root() {
+        let root = Path::new("/repo");
+        assert_eq!(canonical_key(root, Path::new("/elsewhere/x.ts")), None);
+        assert_eq!(canonical_key(root, Path::new("../x.ts")), None);
+        assert_eq!(canonical_key(root, Path::new("src/../../x.ts")), None);
+        assert_eq!(canonical_key(root, Path::new(".")), None);
     }
 }
 
